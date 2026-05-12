@@ -1,21 +1,29 @@
+import torch
 from src.dataset import get_dataloader
+from src.model import MINDTwoTowerModel
+from src.train import train_model
+from src.evaluate import evaluate_model
 
 def main():
-    data_path = 'data/ml-100k/u.data'
-    print("データセットを構築中...")
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+    print(f"使用デバイス: {device}")
+
+    behaviors_path = 'data/mind-small/train/behaviors.tsv'
+    embeddings_path = 'data/mind-small/train/news_embeddings.pt'
     
-    dataloader, num_users, num_items = get_dataloader(data_path, batch_size=5)
+    # ※今回は動作確認のため、同じデータローダーを使います
+    dataloader = get_dataloader(behaviors_path, embeddings_path, batch_size=256, max_rows=50000)
     
-    print(f"ユーザー数: {num_users}, アイテム数: {num_items}")
-    print(f"1エポックあたりのバッチ数: {len(dataloader)}\n")
+    model = MINDTwoTowerModel(input_dim=384, hidden_dim=128)
+    model.to(device)
     
-    # 最初の1バッチだけ取り出して中身を確認
-    for users, items, labels in dataloader:
-        print("--- 1st Batch ---")
-        print(f"Users : {users}")
-        print(f"Items : {items}")
-        print(f"Labels: {labels}")
-        break
+    # --- 学習 ---
+    trained_model = train_model(model, dataloader, device, epochs=5, lr=0.001)
+    torch.save(trained_model.state_dict(), 'two_tower_mind.pth')
+    print("学習済みモデルを 'two_tower_mind.pth' に保存しました。")
+
+    # --- 評価 ---
+    evaluate_model(trained_model, dataloader, device)
 
 if __name__ == "__main__":
     main()

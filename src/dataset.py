@@ -5,64 +5,99 @@ from torch.utils.data import Dataset, DataLoader
 class MINDDataset(Dataset):
     def __init__(self, behaviors_path, embeddings_path, max_rows=None):
         print("1. 埋め込みベクトル（news_embeddings.pt）の読み込み中...")
-        self.news_embeddings = torch.load(embeddings_path)
-        self.emb_dim = 384 # all-MiniLM-L6-v2の次元数
-        self.zero_emb = torch.zeros(self.emb_dim) # 履歴がない場合のゼロベクトル
+        # raw_embeddings = torch.load(embeddings_path)
+        raw_embeddings = torch.load(embeddings_path, map_location=torch.device('cpu'))
+        self.emb_dim = 384
+        self.zero_emb = torch.zeros(self.emb_dim)
+
+        # 【超最適化1】ニュースベクトルを「1つの巨大な行列」にする
+        # nid（文字列）を idx（0始まりの整数）に変換する辞書
+        self.nid2idx = {nid: idx for idx, nid in enumerate(raw_embeddings.keys())}
+        self.unknown_idx = len(raw_embeddings) # 知らないID用は一番最後
+        
+        # 辞書の中身をリストにして、最後にzero_embを足し、stackで行列化
+        emb_list = list(raw_embeddings.values())
+        emb_list.append(self.zero_emb)
+        self.news_matrix = torch.stack(emb_list) # Shape: [ニュースの種類数, 384]
+        
+        # メモリ解放（元の重い辞書は捨てる）
+        del raw_embeddings
 
         print("2. ユーザー行動ログ（behaviors.tsv）の読み込み中...")
         df = pd.read_csv(behaviors_path, sep='\t', names=['impression_id', 'user_id', 'time', 'history', 'impressions'])
         
-        # 開発スピードを上げるため、最初は少ないデータ数で実験できるようにする
         if max_rows is not None:
             df = df.head(max_rows)
 
-        self.samples = []
-        user_hist_cache = {} # ユーザーごとの履歴ベクトルを保存（計算量O(1)化のため）
+        # 【超最適化2】ユーザーベクトルも行列化する準備
+        user_vecs = []
+        uid2idx = {}
+        
+        # 学習サンプルは、重いテンソルではなく「ただの整数配列」として管理する
+        samples_u = []
+        samples_i = []
+        samples_label = []
 
         print("3. 学習用データセットの構築中...")
-        # iterrowsより高速なitertuplesを使用
         for row in df.itertuples():
             uid = row.user_id
             
-            # --- A. ユーザーベクトルの計算（過去の閲覧履歴の平均） ---
-            if uid not in user_hist_cache:
-                # 履歴のIDリストを取得 (NaNの場合は空リスト)
+            # --- ユーザーベクトルの計算 ---
+            if uid not in uid2idx:
                 hist_ids = str(row.history).split() if pd.notna(row.history) else []
-                # IDからベクトルを取得
-                hist_embs = [self.news_embeddings.get(nid, self.zero_emb) for nid in hist_ids]
+                # ニュースIDを整数インデックスに変換
+                hist_idx = [self.nid2idx.get(nid, self.unknown_idx) for nid in hist_ids]
                 
-                if hist_embs:
-                    # 履歴ベクトルの平均(Mean)をとってユーザーの興味ベクトルとする
-                    user_hist_cache[uid] = torch.stack(hist_embs).mean(dim=0)
+                if hist_idx:
+                    # 行列から一気に複数行を取り出して平均（超高速）
+                    u_vec = self.news_matrix[hist_idx].mean(dim=0)
                 else:
-                    user_hist_cache[uid] = self.zero_emb
+                    u_vec = self.zero_emb
+                
+                # 新しいユーザーを登録
+                u_idx = len(user_vecs)
+                uid2idx[uid] = u_idx
+                user_vecs.append(u_vec)
+            else:
+                u_idx = uid2idx[uid]
             
-            u_vec = user_hist_cache[uid]
-            
-            # --- B. インプレッション（今回の推薦候補）の展開 ---
-            # 例: "N123-1 N456-0" -> N123はクリック(1)、N456はスルー(0)
+            # --- インプレッションの展開 ---
             impressions = str(row.impressions).split() if pd.notna(row.impressions) else []
             for imp in impressions:
                 parts = imp.split('-')
                 if len(parts) == 2:
                     nid, label = parts
-                    # メモリ爆発を防ぐため、候補ベクトルは__getitem__で都度取り出す設計にする
-                    self.samples.append((u_vec, nid, float(label)))
+                    n_idx = self.nid2idx.get(nid, self.unknown_idx)
+                    
+                    # ここが最大のポイント！
+                    # テンソルではなく「何番のユーザーか」「何番のニュースか」の整数だけを保存
+                    samples_u.append(u_idx)
+                    samples_i.append(n_idx)
+                    samples_label.append(float(label))
 
-        print(f"構築完了: 合計 {len(self.samples)} サンプル")
+        # ユーザーも1つの巨大な行列にする
+        self.user_matrix = torch.stack(user_vecs) # Shape: [ユーザー数, 384]
+        
+        # 36万件のPythonリストを、PyTorchの軽量な1次元テンソルに変換
+        self.samples_u = torch.tensor(samples_u, dtype=torch.long)
+        self.samples_i = torch.tensor(samples_i, dtype=torch.long)
+        self.samples_label = torch.tensor(samples_label, dtype=torch.float32)
+
+        print(f"構築完了: 合計 {len(self.samples_u)} サンプル")
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.samples_u)
 
     def __getitem__(self, idx):
-        # 1サンプルのデータを取り出す
-        u_vec, candidate_nid, label = self.samples[idx]
+        # 呼ばれたら、保存しておいた整数インデックスを使って行列からO(1)でベクトルを抜く
+        u_idx = self.samples_u[idx]
+        i_idx = self.samples_i[idx]
+        label = self.samples_label[idx]
         
-        # 候補ニュースのベクトルを取得
-        c_vec = self.news_embeddings.get(candidate_nid, self.zero_emb)
+        u_vec = self.user_matrix[u_idx]
+        c_vec = self.news_matrix[i_idx]
         
-        # (ユーザーベクトル, 候補アイテムベクトル, 正解ラベル) を返す
-        return u_vec, c_vec, torch.tensor(label, dtype=torch.float32)
+        return u_vec, c_vec, label
 
 def get_dataloader(behaviors_path, embeddings_path, batch_size=256, max_rows=None):
     dataset = MINDDataset(behaviors_path, embeddings_path, max_rows)

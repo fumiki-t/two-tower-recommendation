@@ -1,3 +1,5 @@
 torch
 pandas
 numpy
+sentence-transformers
+tqdm
